@@ -1,0 +1,119 @@
+#!/env/bin/python
+
+"""
+Name: run
+Description: Implementation of DGANN(Deep Generative Averaging Network) submission
+It combines three network
+    * DAN(Deep Averaging Network): generate feature vector of text_tokens by DAN using GloVe embedded word vectors of text_tokens
+        └── GloVe
+            * window_size:10
+            * epochs:25
+            * learning_rate:0.05
+            * embedding_size:20
+    * GAN(Generative Adversarial Network): oversample imbalance label data[reply, retweet, retweet_c, like] by GAN model
+        It could turn OFF/ON by performance at local training environment.
+    * ANN(Artificial Neural Network): final model which has 3 hidden layers for classification
+
+In submission, test data is split per arbitrary batch_size(100000) due to adopting training code from local environment
+"""
+
+import platform
+import os
+import warnings
+import pickle5 as pickle
+from tqdm import tqdm
+
+from collections import defaultdict
+
+import re
+
+import numpy as np
+import pandas as pd
+
+from processor import AnnProcessor
+
+all_features = ["text_tokens", "hashtags", "tweet_id", "present_media", "present_links",
+                             "present_domains", "tweet_type", "language", "tweet_timestamp", "engaged_with_user_id",
+                             "engaged_with_user_follower_count", "engaged_with_user_following_count", "engaged_with_user_is_verified",
+                             "engaged_with_user_account_creation", "engaging_user_id", "engaging_user_follower_count", "engaging_user_following_count",
+                             "engaging_user_is_verified", "engaging_user_account_creation", "engagee_follows_engager"]
+
+all_features_to_idx = dict(zip(all_features, range(len(all_features))))
+
+project_path = os.path.dirname(os.path.abspath("__file__"))
+input_path = os.path.join(project_path, "input")
+model_path = os.path.join(input_path, "model")
+
+warnings.filterwarnings("ignore")
+
+# function for loading pretrained glove model (window_size:10;  epochs:25; learning_rate:0.05; embedding_size:20)
+def load_glove(model_path):
+    glove_model = f"glove_10_25_0.05_20.model"
+
+    glove = None
+
+    try:
+        with open(os.path.join(model_path, glove_model), "rb") as f:
+            glove = pickle.load(f)
+    except FileNotFoundError:
+        print(f"There is no pretrained glove model at {model_path}")
+
+    return glove
+
+# execution for test submission dataset
+def evaluate_test_set():
+    part_files = [os.path.join('./test', f) for f in os.listdir('./test') if 'part' in f]
+
+    glove = load_glove(model_path)
+    
+    ann_processor = AnnProcessor(model_path, 42, False)
+
+    batch_size = 100000
+
+    pattern = re.compile("part-[0-9a-zA-z-=+,#/\?:^$.@*\"※~&%ㆍ!』\\‘|\(\)\[\]\<\>`\'…》]+$")
+
+    with open('results.csv', 'w') as output:
+        for file in part_files:
+            f_name = re.search(pattern, file).group()
+            with open(file, 'r') as f:
+                lines = f.readlines()
+                batch_num = (len(lines) // batch_size) + 1
+                for idx in tqdm(range(batch_num), desc=f"dgann inference processing per {batch_size} batches at {f_name}"):
+                    last_batch_size = np.inf
+                    if idx == batch_num - 1:
+                        line = lines[(idx * batch_size): ]
+                        last_batch_size = len(line)
+                    else:
+                        line = lines[(idx * batch_size): ((idx + 1) * batch_size)]
+
+                    adj_batch_size = min(batch_size, last_batch_size)
+
+                    dict_all = defaultdict(list)
+                    for li in line:
+                        li = li.strip()
+                        features = li.split("\x01")
+                        for feature, idx in all_features_to_idx.items():
+                            feat = features[idx]
+                            if feature == "text_tokens":
+                                feat = features[idx].replace("\t", " ")
+                            dict_all[feature].append(feat)
+
+                    df_train = pd.DataFrame(dict_all)
+                    df_indexes, dict_data_X = ann_processor.preprocess(df_train, glove, adj_batch_size, model_path)
+                    reply_pred = ann_processor.predict(dict_data_X["reply"], "reply", adj_batch_size, model_path, False)
+                    retweet_pred = ann_processor.predict(dict_data_X["retweet"], "retweet", adj_batch_size, model_path, True)
+                    quote_pred = ann_processor.predict(dict_data_X["retweet_c"], "retweet_c", adj_batch_size, model_path, False)
+                    fave_pred = ann_processor.predict(dict_data_X["like"], "like", adj_batch_size, model_path, True)
+
+                    df_result = df_indexes.copy()
+                    df_result["reply_pred"] = reply_pred
+                    df_result["retweet_pred"] = retweet_pred
+                    df_result["quote_pred"] = quote_pred
+                    df_result["fave_pred"] = fave_pred
+
+                    for idx, value in df_result.iterrows():
+                        tweet_id, user_id, reply_pred, retweet_pred, quote_pred, fav_pred = value
+                        output.write(f'{tweet_id},{user_id},{reply_pred},{retweet_pred},{quote_pred},{fav_pred}\n')
+
+if __name__ == "__main__":
+    evaluate_test_set()
